@@ -1,0 +1,361 @@
+import { uploadFile, deleteFile } from "../services/storage.service.js";
+import { supabase } from "../config/supabase.js";
+import fs from "fs";
+import path from "path";
+import { generateFileHash } from "../utils/hash.js";
+
+
+/**
+ * Detect file type based on extension
+ * @param {string} filename - Original filename
+ * @returns {string} MIME type
+ */
+const getFileType = (filename) => {
+  const ext = filename.split('.').pop().toLowerCase();
+  const mimeTypes = {
+    pdf: 'application/pdf',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    png: 'image/png',
+  };
+  return mimeTypes[ext] || 'application/octet-stream';
+};
+
+/**
+ * Helper to generate signed URLs for a list of records
+ */
+export const addSignedUrlsToRecords = async (records) => {
+  if (!records || records.length === 0) return records;
+
+  const paths = records.map(r => {
+    if (!r.file_url) return null;
+    const parts = r.file_url.split('/public/records/');
+    return parts.length > 1 ? decodeURIComponent(parts[1]) : null;
+  }).filter(Boolean);
+
+  if (paths.length === 0) return records;
+
+  try {
+    const { data: signedUrls, error } = await supabase.storage.from("records").createSignedUrls(paths, 3600);
+    if (error) {
+      console.error("[SIGNED_URL_ERROR]", error.message);
+      return records;
+    }
+
+    const urlMap = {};
+    signedUrls.forEach(item => {
+      if (item.signedUrl) {
+        urlMap[item.path] = item.signedUrl;
+      }
+    });
+
+    return records.map(r => {
+      if (!r.file_url) return r;
+      const parts = r.file_url.split('/public/records/');
+      if (parts.length > 1) {
+        const path = decodeURIComponent(parts[1]);
+        if (urlMap[path]) {
+          r.signed_url = urlMap[path];
+        }
+      }
+      return r;
+    });
+  } catch (err) {
+    console.error("[SIGNED_URL_EXCEPTION]", err.message);
+    return records;
+  }
+};
+
+/**
+ * Get today's date in YYYY-MM-DD format
+ * @returns {string} Today's date
+ */
+const getTodayDate = () => {
+  const today = new Date();
+  return today.toISOString().split('T')[0];
+};
+
+/**
+ * Generate storage path based on upload type
+ * @param {string} userId - User ID
+ * @param {string} filename - Original filename
+ * @param {boolean} isHospitalUpload - Is this a hospital upload
+ * @param {string} hospitalId - Hospital ID (if hospital upload)
+ * @param {string} visitDate - Visit date (if hospital upload)
+ * @returns {string} Storage path
+ */
+const generateStoragePath = (userId, filename, isHospitalUpload, hospitalId, visitDate) => {
+  if (isHospitalUpload) {
+    return `${hospitalId}/${visitDate}/${userId}/${filename}`;
+  }
+  return `${userId}/personal/${filename}`;
+};
+
+/**
+ * Upload medical record with support for patient and hospital uploads
+ * 
+ * CASE 1: Patient Upload (folder_id provided)
+ * - Store in user's personal folder or specified folder
+ * - source = "patient", hospital_id = null, visit_date = null
+ * 
+ * CASE 2: Hospital Upload (hospital_id provided)
+ * - Auto-set visit_date = today
+ * - source = "hospital", folder_id = null
+ * - Path: ${hospital_id}/${visit_date}/${user_id}/${filename}
+ * 
+ * POST /records/upload
+ * Body: { folder_id?, hospital_id? }
+ */
+export const uploadRecord = async (req, res, next) => {
+  try {
+    // Validate file existence
+    if (!req.file) {
+      return res.status(400).json({ error: "No file provided" });
+    }
+
+    const { folder_id, hospital_id } = req.body;
+    const userId = req.user.id;
+    const filename = req.file.originalname;
+    const fileType = getFileType(filename);
+
+    // Determine upload type
+    const isHospitalUpload = !!hospital_id;
+
+    // Build record data object
+    let recordData = {
+      user_id: userId,
+      file_type: fileType,
+      uploaded_by: userId,
+    };
+
+    let storagePath;
+
+    if (isHospitalUpload) {
+      // Security Check: Ensure patient is associated with this hospital
+      const { data: link, error: linkError } = await supabase
+        .from("hospital_users")
+        .select("id")
+        .eq("hospital_id", hospital_id)
+        .eq("user_id", userId)
+        .eq("role", "patient")
+        .maybeSingle();
+
+      if (linkError) throw linkError;
+      if (!link) {
+        return res.status(403).json({ error: "You are not associated with this hospital. Cannot upload to their records." });
+      }
+
+      // CASE 2: Patient uploading to Hospital Section
+      const visitDate = getTodayDate();
+
+      recordData = {
+        ...recordData,
+        hospital_id,
+        visit_date: visitDate,
+        folder_id: null,
+        source: "hospital",
+      };
+
+      storagePath = generateStoragePath(userId, filename, true, hospital_id, visitDate);
+
+      console.log(
+        `[HOSPITAL_UPLOAD] Hospital: ${hospital_id}, Visit: ${visitDate}, User: ${userId}, File: ${filename}`
+      );
+    } else {
+      // CASE 1: Patient Upload
+      recordData = {
+        ...recordData,
+        folder_id: folder_id || null,
+        hospital_id: null,
+        visit_date: null,
+        source: "patient",
+      };
+
+      storagePath = generateStoragePath(userId, filename, false);
+
+      console.log(
+        `[PATIENT_UPLOAD] User: ${userId}, Folder: ${folder_id || 'none'}, File: ${filename}`
+      );
+    }
+
+    // Upload file to storage service
+    const fileUrl = await uploadFile(req.file, storagePath);
+    recordData.file_url = fileUrl;
+
+    // Insert record into database
+    const { data, error } = await supabase
+      .from("records")
+      .insert([recordData])
+      .select();
+
+    if (error) throw error;
+
+    console.log(
+      `[RECORD_CREATED] ID: ${data[0]?.id}, Source: ${recordData.source}, User: ${userId}`
+    );
+
+    const recordId = data[0]?.id;
+
+    // Mark patient summary status as dirty in background
+    if (userId) {
+      supabase
+        .from("patient_ai_summaries")
+        .upsert({
+          patient_id: userId,
+          summary_status: "dirty",
+          updated_at: new Date().toISOString()
+        }, { onConflict: "patient_id" })
+        .then(({ error: upsertErr }) => {
+          if (upsertErr) {
+            console.error(`[PATIENT_AI_DIRTY_ERROR] Failed to mark patient ${userId} dirty:`, upsertErr.message);
+          } else {
+            console.log(`[PATIENT_AI_DIRTY] Marked patient ${userId} as dirty due to record upload`);
+          }
+        });
+    }
+
+    // Trigger AI Summarization for all uploads
+    if (recordId) {
+      try {
+        const tempDir = process.env.VERCEL ? "/tmp/" : "uploads/documents/";
+        if (!fs.existsSync(tempDir)) {
+          fs.mkdirSync(tempDir, { recursive: true });
+        }
+
+        const tempFilePath = path.join(tempDir, `${Date.now()}-${filename}`);
+
+        // Handle both memory and disk storage from multer
+        if (req.file.buffer) {
+          fs.writeFileSync(tempFilePath, req.file.buffer);
+        } else if (req.file.path) {
+          // If already on disk, we could just use req.file.path, 
+          // but the current worker architecture expects it in uploads/documents/
+          fs.copyFileSync(req.file.path, tempFilePath);
+        } else {
+          throw new Error("No file data available for AI processing");
+        }
+
+        const fileHash = await generateFileHash(tempFilePath);
+
+        // Check cache first
+        const { data: cachedData } = await supabase
+          .from("ai_summaries_cache")
+          .select("summary")
+          .eq("file_hash", fileHash)
+          .single();
+
+        if (cachedData && cachedData.summary) {
+          console.log(`[AI_CACHE_HIT] Record: ${recordId}, Hash: ${fileHash}`);
+          // Update record immediately
+          await supabase
+            .from("records")
+            .update({ ai_summary: cachedData.summary })
+            .eq("id", recordId);
+
+          // Cleanup temp file
+          if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+        } else {
+          console.log(`[AI_QUEUE_TRIGGER] Record: ${recordId}, File: ${filename}`);
+          // Add to queue via DB
+          await supabase
+            .from('ai_jobs')
+            .insert({
+              file_path: tempFilePath,
+              mimetype: fileType,
+              file_hash: fileHash,
+              originalname: filename,
+              record_id: recordId,
+              status: 'pending',
+              priority: 'normal'
+            });
+        }
+      } catch (aiError) {
+        console.error("[AI_TRIGGER_ERROR]", aiError.message);
+        // Don't fail the upload if AI trigger fails
+      }
+    }
+
+    res.status(201).json({ record: data[0] });
+
+  } catch (err) {
+    console.error("[UPLOAD_ERROR]", err.message);
+    next(err);
+  }
+};
+
+
+/**
+ * Delete a specific record/file
+ * DELETE /records/:record_id
+ * Auth: User token required (must own the record)
+ */
+export const deleteRecord = async (req, res, next) => {
+  try {
+    const { record_id } = req.params;
+    const userId = req.user.id;
+
+    if (!record_id) {
+      return res.status(400).json({ error: "Record ID is required" });
+    }
+
+    // Fetch the record to verify ownership
+    const { data: record, error: fetchError } = await supabase
+      .from("records")
+      .select("id, user_id, file_url, source, hospital_id")
+      .eq("id", record_id)
+      .single();
+
+    if (fetchError || !record) {
+      return res.status(404).json({ error: "Record not found" });
+    }
+
+    // Verify ownership
+    // 1. If it's a patient/user token, they must own the record (user_id match)
+    // 2. If it's a hospital token, they can only delete records where they are the hospital_id
+    const isOwner = record.user_id === userId;
+    const isAuthorizedHospital = req.user.role === "hospital" && record.hospital_id === req.user.hospital_id;
+
+    if (!isOwner && !isAuthorizedHospital) {
+      return res.status(403).json({ error: "Not authorized to delete this record" });
+    }
+
+    // Delete the file from storage
+    if (record.file_url) {
+      await deleteFile(record.file_url);
+    }
+
+    // Delete the record from database
+    const { error: deleteError } = await supabase
+      .from("records")
+      .delete()
+      .eq("id", record_id);
+
+    if (deleteError) throw deleteError;
+
+    console.log(`[RECORD_DELETED] ID: ${record_id}, User: ${userId}, Source: ${record.source}`);
+
+    // Mark patient summary status as dirty in background
+    if (record.user_id) {
+      supabase
+        .from("patient_ai_summaries")
+        .upsert({
+          patient_id: record.user_id,
+          summary_status: "dirty",
+          updated_at: new Date().toISOString()
+        }, { onConflict: "patient_id" })
+        .then(({ error: upsertErr }) => {
+          if (upsertErr) {
+            console.error(`[PATIENT_AI_DIRTY_ERROR] Failed to mark patient ${record.user_id} dirty:`, upsertErr.message);
+          } else {
+            console.log(`[PATIENT_AI_DIRTY] Marked patient ${record.user_id} as dirty due to record deletion`);
+          }
+        });
+    }
+
+    res.json({ message: "Record deleted successfully" });
+
+  } catch (err) {
+    console.error("[DELETE_RECORD_ERROR]", err.message);
+    next(err);
+  }
+};

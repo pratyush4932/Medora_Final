@@ -1,0 +1,76 @@
+import express from 'express';
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs';
+import { summarizeDocument, summarizeSummaries, getJobStatus, triggerScheduler } from '../controllers/ai.controller.js';
+
+const router = express.Router();
+
+
+// Configure multer for file uploads
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const dir = 'uploads/documents/';
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    cb(null, dir);
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    cb(null, uniqueSuffix + path.extname(file.originalname));
+  },
+});
+
+const upload = multer({
+  storage: storage,
+  fileFilter: (req, file, cb) => {
+    const allowedMimes = [
+      'application/pdf',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'image/jpeg',
+      'image/jpg',
+      'image/png',
+    ];
+    if (allowedMimes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(
+        new Error(
+          'Invalid file type. Only medical documents are allowed: PDF, DOCX, JPG, or PNG files. Please upload medical reports, prescriptions, lab tests, X-rays, or clinical notes.'
+        )
+      );
+    }
+  },
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB per file
+  },
+});
+
+// Routes
+// POST /api/ai/summarize - Summarize documents/images (max 3 files)
+router.post(
+  '/summarize',
+  upload.array('documents', 3), // Max 3 files
+  summarizeDocument
+);
+
+// POST /api/ai/summarize-summaries - Aggregate multiple summaries (max 10)
+router.post(
+  '/summarize-summaries',
+  summarizeSummaries
+);
+
+// POST /api/ai/run-scheduler - Manually run patient AI summary scheduler
+router.post(
+  '/run-scheduler',
+  triggerScheduler
+);
+
+// GET /api/ai/status/:jobId - Check status of background summarization job
+router.get(
+  '/status/:jobId',
+  getJobStatus
+);
+
+export default router;
